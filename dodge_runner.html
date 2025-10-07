@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Dodge Runner — простая игра</title>
+  <style>
+    :root{
+      --bg:#0f1226; --fg:#e7ecff; --accent:#7aa2ff; --accent2:#67f3aa; --danger:#ff6b6b;
+    }
+    html,body{height:100%; margin:0; background:linear-gradient(180deg,#0b0e22,#171a35); color:var(--fg); font-family:system-ui,-apple-system,Segoe UI,Roboto,Inter,Arial,sans-serif;}
+    #wrap{position:fixed; inset:0; display:grid; grid-template-rows:auto 1fr auto;}
+    header,footer{display:flex; align-items:center; justify-content:space-between; padding:10px 14px; backdrop-filter: blur(6px); background:rgba(10,14,30,.35); border-bottom:1px solid rgba(255,255,255,.06)}
+    footer{border-top:1px solid rgba(255,255,255,.06); border-bottom:none}
+    .title{font-weight:700; letter-spacing:.3px}
+    .btn{cursor:pointer; background:var(--accent); color:#0a0d1f; border:none; padding:8px 12px; border-radius:14px; font-weight:700; box-shadow:0 6px 24px rgba(122,162,255,.35); transition:.2s transform}
+    .btn:active{transform:scale(.98)}
+    .muted{opacity:.8}
+    canvas{display:block; width:100%; height:100%;}
+    #overlay{pointer-events:none; position:absolute; inset:0; display:flex; align-items:center; justify-content:center}
+    .card{pointer-events:auto; max-width:640px; width:min(92%,640px); background:rgba(15,18,38,.9); border:1px solid rgba(255,255,255,.08); padding:22px; border-radius:18px; box-shadow:0 10px 40px rgba(0,0,0,.35)}
+    .row{display:flex; gap:10px; flex-wrap:wrap}
+    kbd{background:#111429; border:1px solid rgba(255,255,255,.08); padding:2px 6px; border-radius:6px; font-weight:700}
+    .pill{display:inline-block; padding:2px 10px; border-radius:999px; background:rgba(122,162,255,.15); color:#bcd0ff; border:1px solid rgba(122,162,255,.2)}
+    .danger{color:var(--danger)}
+    .accent{color:var(--accent2)}
+  </style>
+</head>
+<body>
+  <div id="wrap">
+    <header>
+      <div class="title">Dodge Runner <span class="pill">v1.0</span></div>
+      <div class="muted">Очки: <b id="score">0</b> • Рекорд: <b id="best">0</b></div>
+      <button class="btn" id="btnStart">Играть / Пауза</button>
+    </header>
+
+    <div style="position:relative;">
+      <canvas id="game"></canvas>
+      <div id="overlay"></div>
+    </div>
+
+    <footer>
+      <div class="muted">Управление: <kbd>←</kbd><kbd>→</kbd> или <kbd>A</kbd><kbd>D</kbd> • Прыжок: <kbd>Space</kbd> • Мобильный: свайпы</div>
+      <div class="muted">Процедурная генерация препятствий</div>
+    </footer>
+  </div>
+
+<script>
+(() => {
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  const scoreEl = document.getElementById('score');
+  const bestEl = document.getElementById('best');
+  const overlay = document.getElementById('overlay');
+  const btnStart = document.getElementById('btnStart');
+
+  let W = 0, H = 0, DPR = Math.min(2, window.devicePixelRatio || 1);
+  function resize(){
+    W = canvas.clientWidth; H = Math.max(300, canvas.clientHeight);
+    canvas.width = W * DPR; canvas.height = H * DPR; ctx.setTransform(DPR,0,0,DPR,0,0);
+  }
+  const ro = new ResizeObserver(resize); ro.observe(canvas);
+  resize();
+
+  const rand = (a,b)=>a + Math.random()*(b-a);
+  const clamp = (v,a,b)=>Math.max(a,Math.min(b,v));
+
+  const state = {
+    running: false,
+    over: false,
+    t: 0,
+    speed: 180, // px/sec for world scroll
+    diff: 0, // difficulty grows with time
+    score: 0,
+    best: Number(localStorage.getItem('dodgeBest')||0),
+  };
+  bestEl.textContent = state.best;
+
+  const player = {
+    x: 100, y: 0, w: 28, h: 36,
+    vy: 0, onGround: false,
+    color: '#67f3aa'
+  };
+
+  const gravity = 1200; // px/sec^2
+  const jumpV = 520;
+  const lanesY = () => H - 80; // ground level
+
+  const obstacles = []; // rectangles coming from the right
+  const coins = [];
+  let spawnTimer = 0, coinTimer = 0;
+
+  function reset(){
+    state.t = 0; state.score = 0; state.diff = 0; state.over = false; spawnTimer = 0; coinTimer = 0;
+    obstacles.length = 0; coins.length = 0; player.x = 100; player.y = lanesY()-player.h; player.vy = 0; player.onGround = true;
+  }
+
+  function startStop(){
+    if(state.over){ reset(); }
+    state.running = !state.running; if(state.running){ lastTs = performance.now(); loop(lastTs); }
+  }
+
+  btnStart.addEventListener('click', startStop);
+
+  // Input
+  const keys = new Set();
+  window.addEventListener('keydown', e=>{ if(['Space','ArrowLeft','ArrowRight','KeyA','KeyD'].includes(e.code)) e.preventDefault(); keys.add(e.code); if(e.code==='Space') jump(); });
+  window.addEventListener('keyup', e=> keys.delete(e.code));
+
+  // Touch controls
+  let touchStart = null;
+  canvas.addEventListener('touchstart', e=>{touchStart = e.touches[0];});
+  canvas.addEventListener('touchend', e=>{ if(!touchStart) return; const t = touchStart; touchStart = null; const dx = (e.changedTouches[0].clientX - t.clientX); const dy = (e.changedTouches[0].clientY - t.clientY); if(Math.abs(dy) < 40 && Math.abs(dx) > 40){ if(dx>0) move(1); else move(-1); } else if(dy < -30){ jump(); } });
+
+  function move(dir){ player.x += dir * 60; }
+  function jump(){ if(player.onGround){ player.vy = -jumpV; player.onGround = false; }}
+
+  // Procedural generation
+  function spawnObstacle(){
+    const baseH = rand(20, 60 + state.diff*8);
+    const baseW = rand(18, 40 + state.diff*6);
+    const y = lanesY() - baseH;
+    obstacles.push({x: W + rand(0, 60), y, w: baseW, h: baseH, color: '#7aa2ff'});
+  }
+
+  function spawnCoin(){
+    const y = lanesY() - rand(80, 160);
+    coins.push({x: W + rand(0, 60), y, r: 7, value: 10});
+  }
+
+  function rectsOverlap(a,b){ return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y; }
+
+  let lastTs = performance.now();
+  function loop(ts){
+    if(!state.running) return;
+    const dt = Math.min(1/30, (ts - lastTs)/1000); // clamp for tab switching
+    lastTs = ts; state.t += dt; state.diff = Math.min(5, state.t/10);
+
+    update(dt); draw();
+    requestAnimationFrame(loop);
+  }
+
+  function update(dt){
+    // Speed ramps with difficulty
+    const worldSpeed = state.speed * (1 + state.diff*0.35);
+
+    // Player physics
+    player.vy += gravity*dt; player.y += player.vy*dt; if(player.y + player.h >= lanesY()){ player.y = lanesY()-player.h; player.vy = 0; player.onGround = true; }
+
+    // Horizontal input
+    const accel = 520;
+    if(keys.has('ArrowLeft')||keys.has('KeyA')) player.x -= accel*dt;
+    if(keys.has('ArrowRight')||keys.has('KeyD')) player.x += accel*dt;
+    player.x = clamp(player.x, 10, W-10-player.w);
+
+    spawnTimer -= dt; if(spawnTimer<=0){ spawnObstacle(); spawnTimer = rand(0.6, 1.4) / (1 + state.diff*0.25); }
+    coinTimer -= dt; if(coinTimer<=0){ spawnCoin(); coinTimer = rand(1.2, 2.0) / (1 + state.diff*0.15); }
+
+    // Move world
+    for(const o of obstacles) o.x -= worldSpeed*dt;
+    for(const c of coins) c.x -= worldSpeed*dt;
+
+    // Cleanup
+    while(obstacles.length && obstacles[0].x + obstacles[0].w < -50) obstacles.shift();
+    while(coins.length && coins[0].x + coins[0].r < -50) coins.shift();
+
+    // Collisions
+    const pRect = {x:player.x, y:player.y, w:player.w, h:player.h};
+    for(const o of obstacles){ if(rectsOverlap(pRect, o)){ gameOver(); return; } }
+
+    for(let i=coins.length-1;i>=0;i--){ const c=coins[i]; const coinRect = {x:c.x-c.r, y:c.y-c.r, w:c.r*2, h:c.r*2}; if(rectsOverlap(pRect, coinRect)){ state.score += c.value; coins.splice(i,1); }}
+
+    // Scoring for survival
+    state.score += dt*3*(1+state.diff);
+    scoreEl.textContent = Math.floor(state.score);
+  }
+
+  function draw(){
+    ctx.clearRect(0,0,W,H);
+
+    // Parallax background stars
+    const t = state.t;
+    for(let i=0;i<60;i++){
+      const x = (i*73 + (t*20))% (W+100) - 50;
+      const y = (i*97 % H);
+      ctx.globalAlpha = 0.2 + (i%5)/10;
+      ctx.fillStyle = '#bcd0ff';
+      ctx.fillRect(x, y*0.6, 2, 2);
+    }
+    ctx.globalAlpha = 1;
+
+    // Ground
+    ctx.fillStyle = 'rgba(255,255,255,.06)';
+    ctx.fillRect(0, lanesY()+player.h-36, W, 6);
+
+    // Player
+    ctx.fillStyle = player.color;
+    roundRect(ctx, player.x, player.y, player.w, player.h, 6);
+
+    // Obstacles
+    for(const o of obstacles){ ctx.fillStyle = o.color; roundRect(ctx, o.x, o.y, o.w, o.h, 6); }
+
+    // Coins
+    ctx.fillStyle = '#ffd76a';
+    for(const c of coins){ ctx.beginPath(); ctx.arc(c.x, c.y, c.r, 0, Math.PI*2); ctx.fill(); ctx.strokeStyle = 'rgba(0,0,0,.25)'; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(c.x, c.y, c.r-2, 0, Math.PI*2); ctx.stroke(); }
+
+    // If over, show overlay
+    if(state.over){
+      showOverlay();
+    } else {
+      overlay.innerHTML = '';
+    }
+  }
+
+  function showOverlay(){
+    const s = Math.floor(state.score);
+    overlay.innerHTML = `
+      <div class="card">
+        <h2 style="margin:.2em 0 0">Игра окончена</h2>
+        <p class="muted" style="margin:.2em 0 1em">Ваш счёт: <b class="accent">${s}</b> · Рекорд: <b>${state.best}</b></p>
+        <div class="row" style="margin-bottom:10px">
+          <button class="btn" onclick="location.reload()">Перезапустить</button>
+          <button class="btn" style="background:var(--accent2); box-shadow:0 6px 24px rgba(103,243,170,.35)" onclick="window._restart()">Играть ещё</button>
+        </div>
+        <p class="muted">Совет: собирайте монеты и прыгайте через препятствия. Сложность растёт со временем.</p>
+      </div>`;
+  }
+
+  function gameOver(){
+    state.over = true; state.running = false; const s=Math.floor(state.score); if(s>state.best){ state.best = s; localStorage.setItem('dodgeBest', String(s)); bestEl.textContent = s; }
+  }
+
+  function roundRect(ctx, x, y, w, h, r){
+    ctx.beginPath();
+    ctx.moveTo(x+r,y);
+    ctx.arcTo(x+w,y,x+w,y+h,r);
+    ctx.arcTo(x+w,y+h,x,y+h,r);
+    ctx.arcTo(x,y+h,x,y,r);
+    ctx.arcTo(x,y,x+w,y,r);
+    ctx.closePath(); ctx.fill();
+  }
+
+  window._restart = () => { reset(); state.running = true; lastTs = performance.now(); loop(lastTs); };
+
+  // Start screen
+  reset();
+  overlay.innerHTML = `
+    <div class="card">
+      <h2 style="margin:.2em 0 .6em">Dodge Runner</h2>
+      <p class="muted">Уклоняйтесь от препятствий и собирайте монеты. Препятствия генерируются <b>процедурно</b>, сложность растёт с течением времени.</p>
+      <ul style="margin:.6em 0 1em; line-height:1.6">
+        <li>Движение: <kbd>←</kbd> / <kbd>→</kbd> или <kbd>A</kbd> / <kbd>D</kbd></li>
+        <li>Прыжок: <kbd>Space</kbd></li>
+        <li>Мобильный: свайп влево/вправо, свайп вверх — прыжок</li>
+      </ul>
+      <div class="row">
+        <button class="btn" onclick="window._restart()">Начать игру</button>
+      </div>
+    </div>`;
+})();
+</script>
+</body>
+</html>
